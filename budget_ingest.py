@@ -64,7 +64,7 @@ OUTPUT_COLUMNS = ["Account", "Date", "Description", "Amount", "Category"]
 
 # Paste the ID from your sheet URL:
 #   https://docs.google.com/spreadsheets/d/<SPREADSHEET_ID>/edit
-GSHEETS_SPREADSHEET_ID  = "PASTE_YOUR_SHEET_ID_HERE"
+GSHEETS_SPREADSHEET_ID  = "1hJ5LKYnfygg8HU_ORIkkpYX62BnzlyQHGkUMVcTW_S0"
 
 # Name of the worksheet tab to write to (will be created if it doesn't exist)
 GSHEETS_WORKSHEET_NAME  = "Ledger"
