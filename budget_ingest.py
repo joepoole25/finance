@@ -69,6 +69,10 @@ GSHEETS_SPREADSHEET_ID  = "1hJ5LKYnfygg8HU_ORIkkpYX62BnzlyQHGkUMVcTW_S0"
 # Name of the worksheet tab to write to (will be created if it doesn't exist)
 GSHEETS_WORKSHEET_NAME  = "Ledger"
 
+# Worksheet tab GID (from the URL: #gid=XXXXXXXXX) — used to find the tab reliably.
+# Set to None to fall back to matching by GSHEETS_WORKSHEET_NAME instead.
+GSHEETS_WORKSHEET_GID   = 1782790989
+
 # Path to your OAuth credentials JSON downloaded from Google Cloud Console
 GSHEETS_CREDENTIALS_PATH = Path.home() / "credentials.json"
 
@@ -574,13 +578,24 @@ def upload_ledger_to_sheets() -> None:
     gc          = gspread.authorize(creds)
     spreadsheet = gc.open_by_key(GSHEETS_SPREADSHEET_ID)
 
-    try:
-        worksheet = spreadsheet.worksheet(GSHEETS_WORKSHEET_NAME)
-    except gspread.exceptions.WorksheetNotFound:
-        worksheet = spreadsheet.add_worksheet(
-            title=GSHEETS_WORKSHEET_NAME, rows=len(rows) + 100, cols=len(OUTPUT_COLUMNS)
-        )
-        log.info(f"Created new worksheet '{GSHEETS_WORKSHEET_NAME}'.")
+    # Find worksheet by GID (most reliable) or fall back to name
+    worksheet = None
+    if GSHEETS_WORKSHEET_GID is not None:
+        for ws in spreadsheet.worksheets():
+            if ws.id == GSHEETS_WORKSHEET_GID:
+                worksheet = ws
+                break
+        if worksheet is None:
+            log.warning(f"Worksheet GID {GSHEETS_WORKSHEET_GID} not found — falling back to name lookup.")
+
+    if worksheet is None:
+        try:
+            worksheet = spreadsheet.worksheet(GSHEETS_WORKSHEET_NAME)
+        except gspread.exceptions.WorksheetNotFound:
+            worksheet = spreadsheet.add_worksheet(
+                title=GSHEETS_WORKSHEET_NAME, rows=len(rows) + 100, cols=len(OUTPUT_COLUMNS)
+            )
+            log.info(f"Created new worksheet '{GSHEETS_WORKSHEET_NAME}'.")
 
     worksheet.clear()
     worksheet.update(rows, value_input_option="USER_ENTERED")
