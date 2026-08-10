@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 budget_ingest.py — Financial Ingestion, Normalization & Categorization
-Phases 1–4: Detect → Normalize → Categorize → Append → Archive → Upload
+Phases 1–3: Detect → Normalize → Categorize → Append → Archive
 
 Output schema : Account | Date | Description | Amount | Category
 Amount sign   : negative = money OUT (expense/debit)
@@ -13,15 +13,6 @@ Usage:
 
 Add alias to ~/.zshrc:
     alias run-budget='python /Users/BenPoole/Documents/budget/budget_ingest.py'
-
-Google Sheets upload setup (one-time):
-    1. pip install gspread google-auth
-    2. Go to https://console.cloud.google.com → create a project → enable Google Sheets API
-       and Google Drive API → OAuth consent screen (External, add your email as test user)
-       → Credentials → Create OAuth client ID (Desktop app) → Download JSON
-    3. Save the downloaded file as ~/credentials.json  (or update GSHEETS_CREDENTIALS_PATH below)
-    4. Set GSHEETS_SPREADSHEET_ID below to the ID from your sheet URL
-    5. On first run you'll be prompted to authorise in a browser — token is cached after that
 """
 
 import os
@@ -57,27 +48,9 @@ MASTER_LEDGER  = STATEMENTS_DIR / "master_ledger.csv"
 
 OUTPUT_COLUMNS = ["Account", "Date", "Description", "Amount", "Category"]
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# GOOGLE SHEETS CONFIG
-# ─────────────────────────────────────────────────────────────────────────────
-
-# Paste the ID from your sheet URL:
-#   https://docs.google.com/spreadsheets/d/<SPREADSHEET_ID>/edit
-GSHEETS_SPREADSHEET_ID  = "1hJ5LKYnfygg8HU_ORIkkpYX62BnzlyQHGkUMVcTW_S0"
-
-# Name of the worksheet tab to write to (will be created if it doesn't exist)
-GSHEETS_WORKSHEET_NAME  = "Ledger"
-
-# Worksheet tab GID (from the URL: #gid=XXXXXXXXX) — used to find the tab reliably.
-# Set to None to fall back to matching by GSHEETS_WORKSHEET_NAME instead.
-GSHEETS_WORKSHEET_GID   = 1782790989
-
-# Path to your OAuth credentials JSON downloaded from Google Cloud Console
-GSHEETS_CREDENTIALS_PATH = Path.home() / "credentials.json"
-
-# Path where the authorisation token is cached after first login
-GSHEETS_TOKEN_PATH       = Path.home() / ".gsheets_token.json"
+# Banks whose source filename is generic and would collide on monthly re-runs.
+# These are renamed with a YYYYMMDD suffix when archived.
+GENERIC_FILENAME_BANKS = {"AMEX", "Barclays"}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -140,27 +113,36 @@ BANK_CONFIGS: dict = {
     },
 
     "Barclays": {
-        # ── DISABLED — configure once CSV headers are obtained ────────────────
-        # Steps to enable:
-        #   1. Set enabled: True
-        #   2. Set filename_pattern to match Barclays export filename
-        #   3. Paste header row into column_map values
-        #   4. Confirm dayfirst and amount encoding
-        #   5. For split debit/credit columns, change amount_encoding and add:
-        #        "debit_col":  "REPLACE",
-        #        "credit_col": "REPLACE",
+        # ── ENABLED ──────────────────────────────────────────────────────────
+        # Source schema (confirmed from sample):
+        #   Number | Date | Account | Amount | Subcategory | Memo
+        #
+        # WARNING — filename 'data.csv' is extremely generic. ANY file called
+        # data.csv in Downloads will be picked up as Barclays. Strongly
+        # recommend renaming the export to 'barclays_data.csv' and updating
+        # filename_pattern below. Until then, archive_source_files() renames
+        # with a datestamp to avoid re-run overwrite.
+        #
+        # Sign convention differs from AMEX/Lloyds:
+        #   Sample: -9 = money out (Funds Transfer to CHAR MARTIN)
+        #   Therefore source already matches output convention → no flip.
+        #
+        # Description source: Memo column (free text like "CHAR MARTIN OWED FT").
+        # Subcategory ("Funds Transfer" etc.) is the bank's own classification
+        # and is intentionally ignored — it would add noise to keyword matching
+        # against existing rules. Revisit if needed.
         # ─────────────────────────────────────────────────────────────────────
-        "enabled":            False,
-        "filename_pattern":   "TBD_*.csv",         # ← REPLACE
+        "enabled":            True,
+        "filename_pattern":   "data.csv",
         "account_label":      "Barclays",
         "column_map": {
-            "date":           "REPLACE",            # ← REPLACE
-            "description":    "REPLACE",            # ← REPLACE
-            "amount":         "REPLACE",            # ← REPLACE (or remove if split cols)
+            "date":           "Date",
+            "description":    "Memo",
+            "amount":         "Amount",
         },
-        "dayfirst":           True,
+        "dayfirst":           True,                 # 29/05/2026 = 29 May 2026
         "amount_encoding":    "single_signed",
-        "positive_is_debit":  True,
+        "positive_is_debit":  False,                # -9 = out → already matches output convention
         "encoding":           "utf-8-sig",          # Barclays often exports with BOM
         "skiprows":           0,
         "strip_currency":     True,
@@ -350,11 +332,20 @@ def normalize_bank_dataframe(bank_key: str, raw_df: pd.DataFrame) -> pd.DataFram
     # Account — assigned after rows exist so scalar broadcasts correctly
     out["Account"] = config["account_label"]
 
-    # Description
+    # Description — strip whitespace, tabs, and surrounding quote artefacts
+    # (Barclays Memo field embeds tabs and quote chars in the sample data)
     desc_col = col_map.get("description")
     if not desc_col or desc_col not in available:
         raise KeyError(f"[{bank_key}] Description column '{desc_col}' not in CSV. Available: {available}")
-    out["Description"] = raw_df[desc_col].astype(str).str.strip()
+    out["Description"] = (
+        raw_df[desc_col]
+        .astype(str)
+        .str.replace(r"[\t\r\n]+", " ", regex=True)   # collapse embedded tabs/newlines
+        .str.replace(r"\s+", " ", regex=True)         # collapse runs of whitespace
+        .str.strip()
+        .str.strip('"')                               # strip stray surrounding quotes
+        .str.strip()
+    )
 
     # Amount
     out["Amount"] = _normalize_amount(raw_df, config, bank_key)
@@ -488,17 +479,21 @@ def append_to_ledger(df: pd.DataFrame) -> None:
 def archive_source_files(bank_files: dict[str, Path]) -> None:
     """
     Move raw bank CSV files out of Downloads into the Statements directory.
-    AMEX 'activity.csv' is renamed with a datestamp to prevent overwrite on
-    next month's run (Lloyds files already contain a date in their filename).
+    Banks with generic filenames (AMEX 'activity.csv', Barclays 'data.csv')
+    are renamed with a datestamp to prevent overwrite on next month's run.
+    Lloyds files already contain a date in their filename.
     """
     STATEMENTS_DIR.mkdir(parents=True, exist_ok=True)
     today = datetime.today().strftime("%Y%m%d")
 
     for bank_key, src_path in bank_files.items():
-        if bank_key == "AMEX":
-            dest_name = f"amex_activity_{today}.csv"
+        if bank_key in GENERIC_FILENAME_BANKS:
+            # Rename to <bank>_<original_stem>_<date>.<ext>
+            stem = src_path.stem
+            ext  = src_path.suffix
+            dest_name = f"{bank_key.lower()}_{stem}_{today}{ext}"
         else:
-            dest_name = src_path.name  # Lloyds: 9091_DDMMYYYY.csv already unique
+            dest_name = src_path.name  # e.g. Lloyds: 9091_DDMMYYYY.csv already unique
 
         dest_path = STATEMENTS_DIR / dest_name
 
@@ -511,99 +506,6 @@ def archive_source_files(bank_files: dict[str, Path]) -> None:
 
         shutil.move(str(src_path), str(dest_path))
         log.info(f"[{bank_key}] Archived: {src_path.name} → {dest_path}")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# PHASE 5 — GOOGLE SHEETS UPLOAD
-# ─────────────────────────────────────────────────────────────────────────────
-
-def upload_ledger_to_sheets() -> None:
-    """
-    Replace the configured Google Sheets worksheet with the full master ledger.
-    Reads from MASTER_LEDGER on disk so the sheet always matches the file exactly.
-    Skips silently if the spreadsheet ID has not been configured.
-    Requires: pip install gspread google-auth
-    """
-    if GSHEETS_SPREADSHEET_ID == "PASTE_YOUR_SHEET_ID_HERE":
-        log.info("Google Sheets upload skipped — GSHEETS_SPREADSHEET_ID not set.")
-        return
-
-    if not MASTER_LEDGER.exists():
-        log.warning("Google Sheets upload skipped — master_ledger.csv not found.")
-        return
-
-    try:
-        import gspread
-        from google.oauth2.credentials import Credentials
-        from google.auth.transport.requests import Request
-        from google_auth_oauthlib.flow import InstalledAppFlow
-    except ImportError:
-        log.error(
-            "Google Sheets upload requires extra packages. Install with:\n"
-            "    pip install gspread google-auth google-auth-oauthlib"
-        )
-        return
-
-    SCOPES = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive.file",
-    ]
-
-    # Load or refresh OAuth token
-    creds = None
-    if GSHEETS_TOKEN_PATH.exists():
-        creds = Credentials.from_authorized_user_file(str(GSHEETS_TOKEN_PATH), SCOPES)
-
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
-            if not GSHEETS_CREDENTIALS_PATH.exists():
-                log.error(
-                    f"Google OAuth credentials not found at {GSHEETS_CREDENTIALS_PATH}. "
-                    "Download credentials.json from Google Cloud Console."
-                )
-                return
-            flow = InstalledAppFlow.from_client_secrets_file(
-                str(GSHEETS_CREDENTIALS_PATH), SCOPES
-            )
-            creds = flow.run_local_server(port=0)
-
-        GSHEETS_TOKEN_PATH.write_text(creds.to_json())
-
-    # Read ledger and upload
-    ledger = pd.read_csv(MASTER_LEDGER, dtype=str).fillna("")
-    rows   = [ledger.columns.tolist()] + ledger.values.tolist()
-
-    gc          = gspread.authorize(creds)
-    spreadsheet = gc.open_by_key(GSHEETS_SPREADSHEET_ID)
-
-    # Find worksheet by GID (most reliable) or fall back to name
-    worksheet = None
-    if GSHEETS_WORKSHEET_GID is not None:
-        for ws in spreadsheet.worksheets():
-            if ws.id == GSHEETS_WORKSHEET_GID:
-                worksheet = ws
-                break
-        if worksheet is None:
-            log.warning(f"Worksheet GID {GSHEETS_WORKSHEET_GID} not found — falling back to name lookup.")
-
-    if worksheet is None:
-        try:
-            worksheet = spreadsheet.worksheet(GSHEETS_WORKSHEET_NAME)
-        except gspread.exceptions.WorksheetNotFound:
-            worksheet = spreadsheet.add_worksheet(
-                title=GSHEETS_WORKSHEET_NAME, rows=len(rows) + 100, cols=len(OUTPUT_COLUMNS)
-            )
-            log.info(f"Created new worksheet '{GSHEETS_WORKSHEET_NAME}'.")
-
-    worksheet.clear()
-    worksheet.update(rows, value_input_option="USER_ENTERED")
-
-    log.info(
-        f"Google Sheets updated: {len(ledger)} rows → "
-        f"'{GSHEETS_WORKSHEET_NAME}' in spreadsheet {GSHEETS_SPREADSHEET_ID}"
-    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -660,12 +562,6 @@ def run() -> None:
     # Phase 4 — append + archive
     append_to_ledger(combined)
     archive_source_files({k: v for k, v in bank_files.items() if k not in failed})
-
-    # Phase 5 — upload full ledger to Google Sheets
-    try:
-        upload_ledger_to_sheets()
-    except Exception as e:
-        log.error(f"Google Sheets upload failed (ledger on disk is unaffected): {e}")
 
     log.info("Done.")
 
