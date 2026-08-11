@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 budget_ingest.py — Financial Ingestion, Normalization & Categorization
-Phases 1–3: Detect → Normalize → Categorize → Append → Archive
+Phases 1–5: Detect → Normalize → Categorize → Append → Archive → Upload
 
 Output schema : Account | Date | Description | Amount | Category
 Amount sign   : negative = money OUT (expense/debit)
@@ -9,10 +9,16 @@ Amount sign   : negative = money OUT (expense/debit)
 Date format   : DD/MM/YYYY
 
 Usage:
-    python /Users/BenPoole/Documents/budget/budget_ingest.py
+    python3 ~/PycharmProjects/Finance/budget_ingest.py
 
-Add alias to ~/.zshrc:
-    alias run-budget='python /Users/BenPoole/Documents/budget/budget_ingest.py'
+Google Sheets upload setup (one-time):
+    1. pip install gspread google-auth
+    2. Go to https://console.cloud.google.com → create a project → enable Google Sheets API
+       and Google Drive API → OAuth consent screen (External, add your email as test user)
+       → Credentials → Create OAuth client ID (Desktop app) → Download JSON
+    3. Save the downloaded file as ~/credentials.json  (or update GSHEETS_CREDENTIALS_PATH below)
+    4. Set GSHEETS_SPREADSHEET_ID below to the ID from your sheet URL
+    5. On first run you'll be prompted to authorise in a browser — token is cached after that
 """
 
 import os
@@ -51,6 +57,28 @@ OUTPUT_COLUMNS = ["Account", "Date", "Description", "Amount", "Category"]
 # Banks whose source filename is generic and would collide on monthly re-runs.
 # These are renamed with a YYYYMMDD suffix when archived.
 GENERIC_FILENAME_BANKS = {"AMEX", "Barclays"}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GOOGLE SHEETS CONFIG
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Paste the ID from your sheet URL:
+#   https://docs.google.com/spreadsheets/d/<SPREADSHEET_ID>/edit
+GSHEETS_SPREADSHEET_ID  = "1hJ5LKYnfygg8HU_ORIkkpYX62BnzlyQHGkUMVcTW_S0"
+
+# Name of the worksheet tab to write to (will be created if it doesn't exist)
+GSHEETS_WORKSHEET_NAME  = "Ledger"
+
+# Worksheet tab GID (from the URL: #gid=XXXXXXXXX) — used to find the tab reliably.
+# Set to None to fall back to matching by GSHEETS_WORKSHEET_NAME instead.
+GSHEETS_WORKSHEET_GID   = 1782790989
+
+# Path to your OAuth credentials JSON downloaded from Google Cloud Console
+GSHEETS_CREDENTIALS_PATH = Path.home() / "credentials.json"
+
+# Path where the authorisation token is cached after first login
+GSHEETS_TOKEN_PATH       = Path.home() / ".gsheets_token.json"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -509,12 +537,105 @@ def archive_source_files(bank_files: dict[str, Path]) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# PHASE 5 — GOOGLE SHEETS UPLOAD
+# ─────────────────────────────────────────────────────────────────────────────
+
+def upload_ledger_to_sheets() -> None:
+    """
+    Replace the configured Google Sheets worksheet with the full master ledger.
+    Reads from MASTER_LEDGER on disk so the sheet always matches the file exactly.
+    Skips silently if the spreadsheet ID has not been configured.
+    Requires: pip install gspread google-auth
+    """
+    if GSHEETS_SPREADSHEET_ID == "PASTE_YOUR_SHEET_ID_HERE":
+        log.info("Google Sheets upload skipped — GSHEETS_SPREADSHEET_ID not set.")
+        return
+
+    if not MASTER_LEDGER.exists():
+        log.warning("Google Sheets upload skipped — master_ledger.csv not found.")
+        return
+
+    try:
+        import gspread
+        from google.oauth2.credentials import Credentials
+        from google.auth.transport.requests import Request
+        from google_auth_oauthlib.flow import InstalledAppFlow
+    except ImportError:
+        log.error(
+            "Google Sheets upload requires extra packages. Install with:\n"
+            "    pip install gspread google-auth google-auth-oauthlib"
+        )
+        return
+
+    SCOPES = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive.file",
+    ]
+
+    # Load or refresh OAuth token
+    creds = None
+    if GSHEETS_TOKEN_PATH.exists():
+        creds = Credentials.from_authorized_user_file(str(GSHEETS_TOKEN_PATH), SCOPES)
+
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            if not GSHEETS_CREDENTIALS_PATH.exists():
+                log.error(
+                    f"Google OAuth credentials not found at {GSHEETS_CREDENTIALS_PATH}. "
+                    "Download credentials.json from Google Cloud Console."
+                )
+                return
+            flow = InstalledAppFlow.from_client_secrets_file(
+                str(GSHEETS_CREDENTIALS_PATH), SCOPES
+            )
+            creds = flow.run_local_server(port=0)
+
+        GSHEETS_TOKEN_PATH.write_text(creds.to_json())
+
+    # Read ledger and upload
+    ledger = pd.read_csv(MASTER_LEDGER, dtype=str).fillna("")
+    rows   = [ledger.columns.tolist()] + ledger.values.tolist()
+
+    gc          = gspread.authorize(creds)
+    spreadsheet = gc.open_by_key(GSHEETS_SPREADSHEET_ID)
+
+    # Find worksheet by GID (most reliable) or fall back to name
+    worksheet = None
+    if GSHEETS_WORKSHEET_GID is not None:
+        for ws in spreadsheet.worksheets():
+            if ws.id == GSHEETS_WORKSHEET_GID:
+                worksheet = ws
+                break
+        if worksheet is None:
+            log.warning(f"Worksheet GID {GSHEETS_WORKSHEET_GID} not found — falling back to name lookup.")
+
+    if worksheet is None:
+        try:
+            worksheet = spreadsheet.worksheet(GSHEETS_WORKSHEET_NAME)
+        except gspread.exceptions.WorksheetNotFound:
+            worksheet = spreadsheet.add_worksheet(
+                title=GSHEETS_WORKSHEET_NAME, rows=len(rows) + 100, cols=len(OUTPUT_COLUMNS)
+            )
+            log.info(f"Created new worksheet '{GSHEETS_WORKSHEET_NAME}'.")
+
+    worksheet.clear()
+    worksheet.update(rows, value_input_option="USER_ENTERED")
+
+    log.info(
+        f"Google Sheets updated: {len(ledger)} rows → "
+        f"'{GSHEETS_WORKSHEET_NAME}' in spreadsheet {GSHEETS_SPREADSHEET_ID}"
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # ORCHESTRATION
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run() -> None:
     log.info("=" * 60)
-    log.info("Budget Ingest — Phases 1–4")
+    log.info("Budget Ingest — Phases 1–5")
     log.info("=" * 60)
 
     # Phase 1 — detect
@@ -562,6 +683,12 @@ def run() -> None:
     # Phase 4 — append + archive
     append_to_ledger(combined)
     archive_source_files({k: v for k, v in bank_files.items() if k not in failed})
+
+    # Phase 5 — upload full ledger to Google Sheets
+    try:
+        upload_ledger_to_sheets()
+    except Exception as e:
+        log.error(f"Google Sheets upload failed (ledger on disk is unaffected): {e}")
 
     log.info("Done.")
 
