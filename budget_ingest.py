@@ -31,6 +31,8 @@ from pathlib import Path
 
 import pandas as pd
 
+from historical_categorizer import load_history_lookup, apply_history_categories
+
 # ─────────────────────────────────────────────────────────────────────────────
 # LOGGING
 # ─────────────────────────────────────────────────────────────────────────────
@@ -57,6 +59,11 @@ OUTPUT_COLUMNS = ["Account", "Date", "Description", "Amount", "Category"]
 # Banks whose source filename is generic and would collide on monthly re-runs.
 # These are renamed with a YYYYMMDD suffix when archived.
 GENERIC_FILENAME_BANKS = {"AMEX", "Barclays"}
+
+# Trailing window (in months, relative to today) of master_ledger.csv history
+# used to propose categories for transactions the keyword rules miss. See
+# historical_categorizer.py for matching details.
+HISTORY_ROLLING_MONTHS = 12
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -667,9 +674,20 @@ def run() -> None:
     if failed:
         log.warning(f"Banks skipped due to errors: {failed}")
 
-    # Phase 3 — categorize
+    # Phase 3 — categorize: keyword rules first, then fall back to rolling
+    # ledger history for anything still unassigned
     rules     = _load_category_rules()
     combined  = apply_categories(combined, rules)
+
+    history_lookup = load_history_lookup(MASTER_LEDGER, rolling_months=HISTORY_ROLLING_MONTHS)
+    combined       = apply_history_categories(combined, history_lookup)
+
+    final_unassigned = (combined["Category"] == "unassigned").sum()
+    log.info(
+        f"Final categorization: {len(combined) - final_unassigned} assigned, "
+        f"{final_unassigned} unassigned "
+        f"({final_unassigned/len(combined)*100:.1f}% — review these)."
+    )
 
     # Preview
     log.info(f"\n{'─'*60}")

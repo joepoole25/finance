@@ -31,6 +31,20 @@ HOW TO ADD A NEW RULE:
   to validate before next run.
 """
 
+# ─────────────────────────────────────────────────────────────────────────────
+# AMBIGUOUS MERCHANTS
+# Description substrings (case-insensitive) that must NEVER be auto-assigned
+# from historical patterns (see historical_categorizer.py), because the same
+# merchant genuinely spans multiple categories depending on context. Mirrors
+# the "WHAT WILL CORRECTLY STAY UNASSIGNED" list in the module docstring above.
+# ─────────────────────────────────────────────────────────────────────────────
+
+AMBIGUOUS_MERCHANT_KEYWORDS: list[str] = [
+    "CHAR MARTIN", "MARTIN C E", "POOLE SE", "BENJAMIN JOHN POOL",
+    "UBER", "AMAZON", "EBAY", "PAYPAL *ALIPAY",
+]
+
+
 CATEGORY_RULES: list[dict] = [
 
     # ══════════════════════════════════════════════════════════════════════════
