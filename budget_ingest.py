@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 budget_ingest.py — Financial Ingestion, Normalization & Categorization
-Phases 1–5: Detect → Normalize → Categorize → Append → Archive → Upload
+Phases 0–5: Pull → Detect → Normalize → Categorize → Append → Archive → Upload
 
 Output schema : Account | Date | Description | Amount | Category
 Amount sign   : negative = money OUT (expense/debit)
@@ -19,6 +19,22 @@ Google Sheets upload setup (one-time):
     3. Save the downloaded file as ~/credentials.json  (or update GSHEETS_CREDENTIALS_PATH below)
     4. Set GSHEETS_SPREADSHEET_ID below to the ID from your sheet URL
     5. On first run you'll be prompted to authorise in a browser — token is cached after that
+
+TESTING (without touching live data):
+    Categorization now learns from whatever is CURRENTLY in the Google Sheet
+    (Phase 0 pulls it fresh each run — see download_ledger_from_sheets()),
+    since that's where manual category corrections actually live. To test
+    the full pipeline safely:
+        1. In Google Sheets, File -> Make a copy of your ledger spreadsheet.
+           Note the new spreadsheet ID from its URL (the tab name "Ledger"
+           is matched by name, so the copy doesn't need the same tab GID).
+        2. Run with all three paths/IDs pointed at throwaway locations:
+               FINANCE_DOWNLOADS_DIR=/tmp/finance_test/downloads \\
+               FINANCE_STATEMENTS_DIR=/tmp/finance_test/statements \\
+               FINANCE_SPREADSHEET_ID=<copied-test-sheet-id> \\
+               python3 budget_ingest.py
+        With no env vars set, a run behaves exactly as before and touches
+        only production paths/spreadsheet.
 """
 
 import os
@@ -31,7 +47,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from historical_categorizer import load_history_lookup, apply_history_categories
+from historical_categorizer import build_history_lookup, apply_history_categories
 
 # ─────────────────────────────────────────────────────────────────────────────
 # LOGGING
@@ -50,8 +66,12 @@ log = logging.getLogger(__name__)
 # PATHS
 # ─────────────────────────────────────────────────────────────────────────────
 
-DOWNLOADS_DIR  = Path("/Users/BenPoole/Downloads")
-STATEMENTS_DIR = Path("/Users/BenPoole/Documents/Joe/Statements")
+# Overridable via env vars so a full pipeline run (including the Google Sheets
+# round-trip) can be pointed at throwaway locations for testing — see the
+# "TESTING" section below. Unset, these default to production paths/IDs, so a
+# normal run's behavior is unchanged.
+DOWNLOADS_DIR  = Path(os.environ.get("FINANCE_DOWNLOADS_DIR", "/Users/BenPoole/Downloads"))
+STATEMENTS_DIR = Path(os.environ.get("FINANCE_STATEMENTS_DIR", "/Users/BenPoole/Documents/Joe/Statements"))
 MASTER_LEDGER  = STATEMENTS_DIR / "master_ledger.csv"
 
 OUTPUT_COLUMNS = ["Account", "Date", "Description", "Amount", "Category"]
@@ -72,7 +92,10 @@ HISTORY_ROLLING_MONTHS = 12
 
 # Paste the ID from your sheet URL:
 #   https://docs.google.com/spreadsheets/d/<SPREADSHEET_ID>/edit
-GSHEETS_SPREADSHEET_ID  = "1hJ5LKYnfygg8HU_ORIkkpYX62BnzlyQHGkUMVcTW_S0"
+# Override with FINANCE_SPREADSHEET_ID for test runs (see "TESTING" below).
+GSHEETS_SPREADSHEET_ID  = os.environ.get(
+    "FINANCE_SPREADSHEET_ID", "1hJ5LKYnfygg8HU_ORIkkpYX62BnzlyQHGkUMVcTW_S0"
+)
 
 # Name of the worksheet tab to write to (will be created if it doesn't exist)
 GSHEETS_WORKSHEET_NAME  = "Ledger"
@@ -544,24 +567,17 @@ def archive_source_files(bank_files: dict[str, Path]) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PHASE 5 — GOOGLE SHEETS UPLOAD
+# GOOGLE SHEETS — SHARED CLIENT & WORKSHEET LOOKUP
+# ─────────────────────────────────────────────────────────────────────────────
+# Used by both the Phase 0 pull (download_ledger_from_sheets) and the Phase 5
+# push (upload_ledger_to_sheets) so auth and tab lookup only live in one place.
 # ─────────────────────────────────────────────────────────────────────────────
 
-def upload_ledger_to_sheets() -> None:
+def _get_gspread_client():
     """
-    Replace the configured Google Sheets worksheet with the full master ledger.
-    Reads from MASTER_LEDGER on disk so the sheet always matches the file exactly.
-    Skips silently if the spreadsheet ID has not been configured.
-    Requires: pip install gspread google-auth
+    Authorise and return a gspread client, or None if the required packages
+    or credentials aren't available. Caches/refreshes the OAuth token on disk.
     """
-    if GSHEETS_SPREADSHEET_ID == "PASTE_YOUR_SHEET_ID_HERE":
-        log.info("Google Sheets upload skipped — GSHEETS_SPREADSHEET_ID not set.")
-        return
-
-    if not MASTER_LEDGER.exists():
-        log.warning("Google Sheets upload skipped — master_ledger.csv not found.")
-        return
-
     try:
         import gspread
         from google.oauth2.credentials import Credentials
@@ -569,17 +585,16 @@ def upload_ledger_to_sheets() -> None:
         from google_auth_oauthlib.flow import InstalledAppFlow
     except ImportError:
         log.error(
-            "Google Sheets upload requires extra packages. Install with:\n"
+            "Google Sheets access requires extra packages. Install with:\n"
             "    pip install gspread google-auth google-auth-oauthlib"
         )
-        return
+        return None
 
     SCOPES = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive.file",
     ]
 
-    # Load or refresh OAuth token
     creds = None
     if GSHEETS_TOKEN_PATH.exists():
         creds = Credentials.from_authorized_user_file(str(GSHEETS_TOKEN_PATH), SCOPES)
@@ -593,7 +608,7 @@ def upload_ledger_to_sheets() -> None:
                     f"Google OAuth credentials not found at {GSHEETS_CREDENTIALS_PATH}. "
                     "Download credentials.json from Google Cloud Console."
                 )
-                return
+                return None
             flow = InstalledAppFlow.from_client_secrets_file(
                 str(GSHEETS_CREDENTIALS_PATH), SCOPES
             )
@@ -601,14 +616,20 @@ def upload_ledger_to_sheets() -> None:
 
         GSHEETS_TOKEN_PATH.write_text(creds.to_json())
 
-    # Read ledger and upload
-    ledger = pd.read_csv(MASTER_LEDGER, dtype=str).fillna("")
-    rows   = [ledger.columns.tolist()] + ledger.values.tolist()
+    import gspread
+    return gspread.authorize(creds)
 
-    gc          = gspread.authorize(creds)
+
+def _get_ledger_worksheet(gc, create_if_missing: bool, rows_hint: int = 100):
+    """
+    Find the configured worksheet tab by GID (preferred) or fall back to
+    matching by name. If create_if_missing, creates the tab when neither
+    lookup succeeds (used on push; pull should never create a tab).
+    """
+    import gspread
+
     spreadsheet = gc.open_by_key(GSHEETS_SPREADSHEET_ID)
 
-    # Find worksheet by GID (most reliable) or fall back to name
     worksheet = None
     if GSHEETS_WORKSHEET_GID is not None:
         for ws in spreadsheet.worksheets():
@@ -622,10 +643,97 @@ def upload_ledger_to_sheets() -> None:
         try:
             worksheet = spreadsheet.worksheet(GSHEETS_WORKSHEET_NAME)
         except gspread.exceptions.WorksheetNotFound:
+            if not create_if_missing:
+                raise
             worksheet = spreadsheet.add_worksheet(
-                title=GSHEETS_WORKSHEET_NAME, rows=len(rows) + 100, cols=len(OUTPUT_COLUMNS)
+                title=GSHEETS_WORKSHEET_NAME, rows=rows_hint, cols=len(OUTPUT_COLUMNS)
             )
             log.info(f"Created new worksheet '{GSHEETS_WORKSHEET_NAME}'.")
+
+    return worksheet
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PHASE 0 — PULL CURRENT LEDGER FROM GOOGLE SHEETS
+# ─────────────────────────────────────────────────────────────────────────────
+# The Sheet — not the local CSV — is where manual category corrections are
+# made, so it's the source of truth for "what do we currently know". This is
+# pulled fresh at the start of every run and used both to build the history
+# lookup (Phase 3) and as the base the new batch gets layered onto before
+# being pushed back (Phase 5).
+# ─────────────────────────────────────────────────────────────────────────────
+
+def download_ledger_from_sheets() -> pd.DataFrame | None:
+    """
+    Fetch the current ledger from the configured Google Sheet.
+
+    Returns:
+        DataFrame  — successful pull, current Sheet contents (may be empty).
+        None       — GSHEETS_SPREADSHEET_ID not configured; caller should
+                     fall back to the local master ledger CSV (offline/test
+                     mode with Sheets disabled).
+
+    Raises:
+        RuntimeError — the Sheet IS configured but couldn't be reached/read.
+                       Callers MUST treat this as fatal and abort the run:
+                       proceeding with stale/absent data risks Phase 5 later
+                       overwriting the Sheet and losing real corrections.
+    """
+    if GSHEETS_SPREADSHEET_ID == "PASTE_YOUR_SHEET_ID_HERE":
+        log.info("Sheets pull skipped — GSHEETS_SPREADSHEET_ID not set. Falling back to local ledger CSV.")
+        return None
+
+    gc = _get_gspread_client()
+    if gc is None:
+        raise RuntimeError(
+            "GSHEETS_SPREADSHEET_ID is configured but the Sheets client could not be "
+            "initialised (see error above). Aborting rather than risk stale-data overwrite."
+        )
+
+    try:
+        worksheet = _get_ledger_worksheet(gc, create_if_missing=False)
+        records = worksheet.get_all_records()
+    except Exception as e:
+        raise RuntimeError(f"Failed to pull ledger from Google Sheets: {e}") from e
+
+    if not records:
+        log.info("Sheets pull: worksheet is empty — starting from a blank ledger.")
+        return pd.DataFrame(columns=OUTPUT_COLUMNS)
+
+    df = pd.DataFrame.from_records(records)
+    missing = set(OUTPUT_COLUMNS) - set(df.columns)
+    if missing:
+        raise RuntimeError(f"Sheet is missing expected column(s): {sorted(missing)}")
+
+    df["Amount"] = pd.to_numeric(df["Amount"], errors="coerce")
+    df = df[OUTPUT_COLUMNS]
+    log.info(f"Sheets pull: {len(df)} row(s) fetched as current ledger state.")
+    return df
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PHASE 5 — GOOGLE SHEETS UPLOAD
+# ─────────────────────────────────────────────────────────────────────────────
+
+def upload_ledger_to_sheets(ledger: pd.DataFrame) -> None:
+    """
+    Replace the configured Google Sheets worksheet with `ledger` (the current
+    Sheet state pulled in Phase 0, with this run's new batch layered on top —
+    see run()). Skips silently if the spreadsheet ID has not been configured.
+    Requires: pip install gspread google-auth
+    """
+    if GSHEETS_SPREADSHEET_ID == "PASTE_YOUR_SHEET_ID_HERE":
+        log.info("Google Sheets upload skipped — GSHEETS_SPREADSHEET_ID not set.")
+        return
+
+    gc = _get_gspread_client()
+    if gc is None:
+        return
+
+    ledger = ledger.fillna("").astype(str)
+    rows   = [ledger.columns.tolist()] + ledger.values.tolist()
+
+    worksheet = _get_ledger_worksheet(gc, create_if_missing=True, rows_hint=len(rows) + 100)
 
     worksheet.clear()
     worksheet.update(rows, value_input_option="USER_ENTERED")
@@ -640,10 +748,37 @@ def upload_ledger_to_sheets() -> None:
 # ORCHESTRATION
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _read_local_ledger() -> pd.DataFrame:
+    """Read MASTER_LEDGER from disk, or an empty frame if it doesn't exist yet."""
+    if not MASTER_LEDGER.exists():
+        return pd.DataFrame(columns=OUTPUT_COLUMNS)
+    ledger = pd.read_csv(MASTER_LEDGER, dtype=str)
+    ledger["Amount"] = pd.to_numeric(ledger["Amount"], errors="coerce")
+    return ledger[OUTPUT_COLUMNS]
+
+
 def run() -> None:
     log.info("=" * 60)
-    log.info("Budget Ingest — Phases 1–5")
+    log.info("Budget Ingest — Phases 0–5")
     log.info("=" * 60)
+
+    # Phase 0 — pull the CURRENT ledger state (Google Sheets is the source of
+    # truth for manual category corrections; local CSV is an append-only
+    # audit trail that never receives them). Abort if Sheets is configured
+    # but unreachable — never guess with stale data before Phase 5 could
+    # overwrite real corrections.
+    try:
+        existing_ledger = download_ledger_from_sheets()
+    except RuntimeError as e:
+        log.error(str(e))
+        sys.exit(1)
+
+    if existing_ledger is None:
+        existing_ledger = _read_local_ledger()
+        log.warning(
+            f"Sheets not configured — using local ledger ({len(existing_ledger)} rows) "
+            f"as history source. Manual corrections made only in Sheets won't be seen."
+        )
 
     # Phase 1 — detect
     bank_files = detect_bank_files()
@@ -675,11 +810,12 @@ def run() -> None:
         log.warning(f"Banks skipped due to errors: {failed}")
 
     # Phase 3 — categorize: keyword rules first, then fall back to rolling
-    # ledger history for anything still unassigned
+    # history (from the freshly-pulled current ledger state) for anything
+    # still unassigned
     rules     = _load_category_rules()
     combined  = apply_categories(combined, rules)
 
-    history_lookup = load_history_lookup(MASTER_LEDGER, rolling_months=HISTORY_ROLLING_MONTHS)
+    history_lookup = build_history_lookup(existing_ledger, rolling_months=HISTORY_ROLLING_MONTHS)
     combined       = apply_history_categories(combined, history_lookup)
 
     final_unassigned = (combined["Category"] == "unassigned").sum()
@@ -698,13 +834,17 @@ def run() -> None:
     log.info(f"Date range: {combined['Date'].min()} → {combined['Date'].max()}")
     log.info(f"{'─'*60}")
 
-    # Phase 4 — append + archive
+    # Phase 4 — append (local CSV stays a pure append-only audit trail of raw
+    # ingests — never overwritten) + archive source files
     append_to_ledger(combined)
     archive_source_files({k: v for k, v in bank_files.items() if k not in failed})
 
-    # Phase 5 — upload full ledger to Google Sheets
+    # Phase 5 — push the current Sheet state + this run's new batch back to
+    # Google Sheets, so corrections already in the Sheet are layered under
+    # (not clobbered by) the new rows, instead of overwriting from local disk
+    reconciled = pd.concat([existing_ledger, combined], ignore_index=True)
     try:
-        upload_ledger_to_sheets()
+        upload_ledger_to_sheets(reconciled)
     except Exception as e:
         log.error(f"Google Sheets upload failed (ledger on disk is unaffected): {e}")
 

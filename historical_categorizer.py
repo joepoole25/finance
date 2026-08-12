@@ -33,7 +33,6 @@ from __future__ import annotations
 import re
 import logging
 from collections import Counter, defaultdict
-from pathlib import Path
 from datetime import datetime
 
 import pandas as pd
@@ -86,33 +85,29 @@ def _is_ambiguous(normalized_desc: str) -> bool:
 # LOOKUP CONSTRUCTION
 # ─────────────────────────────────────────────────────────────────────────────
 
-def load_history_lookup(
-    ledger_path: Path,
+def build_history_lookup(
+    hist_df: pd.DataFrame,
     rolling_months: int = HISTORY_ROLLING_MONTHS,
     as_of: datetime | None = None,
 ) -> dict[tuple[str, str], str]:
     """
     Build a {(normalized_description, direction): category} lookup from the
-    trailing `rolling_months` of already-categorized rows in the master ledger.
+    trailing `rolling_months` of already-categorized rows in `hist_df`.
 
-    Returns an empty dict (never raises) if the ledger doesn't exist yet, is
-    empty, or has no usable history — the categorizer simply falls back to
-    keyword rules only in that case.
+    `hist_df` should be the CURRENT state of the ledger — i.e. pulled fresh
+    from wherever categories actually get corrected (see budget_ingest.py's
+    download_ledger_from_sheets()), not a local cache that may have drifted
+    from manual corrections made elsewhere.
+
+    Returns an empty dict (never raises) if `hist_df` is empty/None or has no
+    usable history — the categorizer simply falls back to keyword rules only
+    in that case.
     """
-    if not ledger_path.exists():
-        log.info(f"History lookup skipped — {ledger_path.name} does not exist yet.")
+    if hist_df is None or hist_df.empty or not {"Date", "Description", "Amount", "Category"}.issubset(hist_df.columns):
+        log.info("History lookup skipped — no usable ledger history provided.")
         return {}
 
-    try:
-        hist = pd.read_csv(ledger_path, dtype=str)
-    except Exception as e:
-        log.warning(f"History lookup skipped — failed to read {ledger_path.name}: {e}")
-        return {}
-
-    if hist.empty or not {"Date", "Description", "Amount", "Category"}.issubset(hist.columns):
-        log.info("History lookup skipped — ledger is empty or missing expected columns.")
-        return {}
-
+    hist = hist_df.copy()
     hist["_date"] = pd.to_datetime(hist["Date"], format="%d/%m/%Y", errors="coerce")
     cutoff = (as_of or datetime.today()) - pd.DateOffset(months=rolling_months)
     hist = hist[hist["_date"] >= cutoff]
