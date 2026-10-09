@@ -36,7 +36,7 @@ TESTING (without touching live data):
         With no env vars set, a run behaves exactly as before and touches
         only production paths/spreadsheet.
 """
-
+from __future__ import annotations
 import os
 import sys
 import glob
@@ -583,6 +583,7 @@ def _get_gspread_client():
         from google.oauth2.credentials import Credentials
         from google.auth.transport.requests import Request
         from google_auth_oauthlib.flow import InstalledAppFlow
+        from google.auth.exceptions import RefreshError
     except ImportError:
         log.error(
             "Google Sheets access requires extra packages. Install with:\n"
@@ -599,22 +600,27 @@ def _get_gspread_client():
     if GSHEETS_TOKEN_PATH.exists():
         creds = Credentials.from_authorized_user_file(str(GSHEETS_TOKEN_PATH), SCOPES)
 
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
+    if creds and not creds.valid and creds.expired and creds.refresh_token:
+        try:
             creds.refresh(Request())
-        else:
-            if not GSHEETS_CREDENTIALS_PATH.exists():
-                log.error(
-                    f"Google OAuth credentials not found at {GSHEETS_CREDENTIALS_PATH}. "
-                    "Download credentials.json from Google Cloud Console."
-                )
-                return None
-            flow = InstalledAppFlow.from_client_secrets_file(
-                str(GSHEETS_CREDENTIALS_PATH), SCOPES
-            )
-            creds = flow.run_local_server(port=0)
+        except RefreshError as e:
+            log.warning(f"Cached Google token rejected ({e}). Re-authorising via browser.")
+            GSHEETS_TOKEN_PATH.unlink(missing_ok=True)
+            creds = None
 
-        GSHEETS_TOKEN_PATH.write_text(creds.to_json())
+    if not creds or not creds.valid:
+        if not GSHEETS_CREDENTIALS_PATH.exists():
+            log.error(
+                f"Google OAuth credentials not found at {GSHEETS_CREDENTIALS_PATH}. "
+                "Download credentials.json from Google Cloud Console."
+            )
+            return None
+        flow = InstalledAppFlow.from_client_secrets_file(
+            str(GSHEETS_CREDENTIALS_PATH), SCOPES
+        )
+        creds = flow.run_local_server(port=0)
+
+    GSHEETS_TOKEN_PATH.write_text(creds.to_json())
 
     import gspread
     return gspread.authorize(creds)
